@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+<title>Inventory Scanner</title>
+
+<script src="https://unpkg.com/html5-qrcode"></script>
+
+<style>
+html, body {
+  margin: 0;
+  padding: 0;
+  background: black;
+  color: white;
+  font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+}
+#reader {
+  width: 100vw;
+  height: 65vh;
+}
+.panel {
+  padding: 12px;
+  background: rgba(0,0,0,0.85);
+}
+input, select, button {
+  width: 100%;
+  padding: 10px;
+  margin-top: 6px;
+  font-size: 16px;
+  border-radius: 6px;
+  border: none;
+}
+.button-row {
+  display: flex;
+  gap: 10px;
+  margin-top: 10px;
+}
+button {
+  font-weight: bold;
+  flex: 1;
+}
+button.done { background: #22c55e; color: black; }
+button.clear { background: #ef4444; color: white; }
+
+.list { margin-top: 10px; font-size: 14px; }
+.item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px dashed #444;
+  padding: 6px 0;
+}
+.item input {
+  width: 70px;
+  text-align: center;
+}
+.status {
+  margin-top: 8px;
+  font-size: 14px;
+}
+</style>
+</head>
+
+<body>
+
+<div id="reader"></div>
+
+<div class="panel">
+  <label>OPERATOR</label>
+  <input id="operator" placeholder="Name (required)" />
+
+  <label>JOB / PO / ORDER</label>
+  <input id="job" placeholder="J1234 or P5678 (required)" />
+
+  <label>REASON</label>
+  <input id="reason" placeholder="Reason (required)" />
+
+  <label>ACTION</label>
+  <select id="action">
+    <option value="withdraw">Withdraw (−)</option>
+    <option value="add">Add (+)</option>
+  </select>
+
+  <div style="margin-top:8px">
+    <strong>Total Scans:</strong> <span id="total">0</span><br>
+    <strong>Last Item:</strong> <span id="last">—</span>
+  </div>
+
+  <div class="list" id="items"></div>
+
+  <div class="button-row">
+    <button class="done" onclick="submitSession()">DONE</button>
+    <button class="clear" onclick="clearSession(true)">CLEAR</button>
+  </div>
+
+  <div id="status" class="status"></div>
+</div>
+
+<audio id="beep" preload="auto">
+  <source src="https://actions.google.com/sounds/v1/cartoon/wood_plank_flicks.ogg">
+</audio>
+
+<script>
+const ENDPOINT = "https://script.google.com/macros/s/AKfycbzppca6YuCE8IKqhgGxhXnf7KwgmUz9KiKiWgBdsi5dIBqcwqcg-qcyTpEiXX53lEd8/exec";
+
+let items = {};
+let totalScans = 0;
+let lastItem = "";
+
+let lastScanText = "";
+let lastScanTime = 0;
+const SCAN_COOLDOWN_MS = 1200;
+
+const beep = document.getElementById("beep");
+
+// Unlock beep on first touch so iOS allows sound
+document.body.addEventListener("touchstart", () => {
+  beep.currentTime = 0;
+  beep.play().then(() => beep.pause()).catch(()=>{});
+}, { once: true });
+
+function updateUI() {
+  document.getElementById("total").innerText = totalScans;
+  document.getElementById("last").innerText = lastItem || "—";
+
+  const list = document.getElementById("items");
+  list.innerHTML = "";
+
+  Object.entries(items).forEach(([id, qty]) => {
+    const row = document.createElement("div");
+    row.className = "item";
+    row.innerHTML = `
+      <span>${id}</span>
+      <input type="number" min="0" value="${qty}"
+        onchange="items['${id}']=Number(this.value)||0">
+    `;
+    list.appendChild(row);
+  });
+}
+
+function onScanSuccess(text) {
+  const now = Date.now();
+  if (text === lastScanText && (now - lastScanTime) < SCAN_COOLDOWN_MS) return;
+
+  lastScanText = text;
+  lastScanTime = now;
+
+  if (!items[text]) items[text] = 0;
+  items[text]++;
+  totalScans++;
+  lastItem = text;
+
+  beep.currentTime = 0;
+  beep.play().catch(()=>{});
+  updateUI();
+}
+
+const scanner = new Html5Qrcode("reader");
+scanner.start(
+  { facingMode: { exact: "environment" } },
+  { fps: 15, qrbox: { width: 300, height: 150 } },
+  onScanSuccess,
+  () => {}
+);
+
+function clearSession(requireConfirm) {
+  if (requireConfirm && Object.keys(items).length > 0) {
+    if (!confirm("Clear current session?")) return;
+  }
+  items = {};
+  totalScans = 0;
+  lastItem = "";
+  updateUI();
+  document.getElementById("status").innerText = "Session cleared";
+}
+
+async function submitSession() {
+  const operator = document.getElementById("operator").value.trim();
+  const job = document.getElementById("job").value.trim();
+  const reason = document.getElementById("reason").value.trim();
+  const action = document.getElementById("action").value;
+
+  if (!operator || !job || !location) {
+    document.getElementById("status").innerText = "❌ Operator, Job/PO, and Reason are required.";
+    return;
+  }
+  if (!Object.keys(items).length) {
+    document.getElementById("status").innerText = "❌ No items scanned.";
+    return;
+  }
+
+  document.getElementById("status").innerText = "Sending to Google Sheets…";
+
+  try {
+    for (const [itemId, qty] of Object.entries(items)) {
+      const payload = {
+        itemId,
+        quantity: qty,
+        action,
+        jobNumber: job,
+        reason: reason,
+        user: operator    // << operator goes to Modified By
+      };
+
+      const res = await fetch(ENDPOINT, {
+        method: "POST",
+        body: JSON.stringify(payload)
+      });
+
+      const json = await res.json();
+      if (!json.success) throw json.message || "Unknown error";
+    }
+
+    document.getElementById("status").innerText = "✅ Inventory Updated Successfully";
+    clearSession(false); // no confirm after successful submit
+
+  } catch (err) {
+    document.getElementById("status").innerText = "❌ FAILED: " + err;
+  }
+}
+</script>
+
+</body>
+</html>
